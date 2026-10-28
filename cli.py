@@ -54,6 +54,7 @@ from animation_engine import (
     AnimationEngine,
     create_effect,
     daemon_status,
+    install_stop_handlers,
     start_daemon,
     stop_daemon,
 )
@@ -310,6 +311,10 @@ def _run_effect(args: argparse.Namespace) -> int:
         effect.close()
         return 0
 
+    if spatial and diagonal and args.name != "rainbow":
+        print("note: --diagonal only applies to the rainbow effect; ignoring it",
+              file=sys.stderr)
+
     engine = AnimationEngine(
         effect,
         fps=args.fps,
@@ -317,6 +322,7 @@ def _run_effect(args: argparse.Namespace) -> int:
         device_path=args.path,
         final=args.final,
     )
+    install_stop_handlers(engine)
 
     print(f"effect: {args.name}  fps: {args.fps}  (Ctrl+C to stop)")
     if spatial:
@@ -337,11 +343,19 @@ def _start_daemon(args: argparse.Namespace) -> int:
         print(f"unknown effect {args.name!r}; choose from: {', '.join(EFFECTS)}", file=sys.stderr)
         return 2
 
+    if args.diagonal and args.name != "rainbow":
+        print("note: --diagonal only applies to the rainbow effect; ignoring it",
+              file=sys.stderr)
+
+    audio_source = "wasapi" if getattr(args, "real_audio", False) else args.audio_source
+
     pid = start_daemon(
         args.name,
         fps=args.fps,
         brightness=args.brightness,
-        audio_source=args.audio_source,
+        audio_source=audio_source,
+        spatial=args.spatial,
+        diagonal=args.diagonal,
     )
     print(f"animation daemon running (pid {pid})")
     print(f"log: {LOG_FILE}")
@@ -513,6 +527,12 @@ def main(argv: list[str] | None = None) -> int:
                          choices=range(LEVEL_MIN, LEVEL_MAX + 1))
     p_start.add_argument("--audio-source", default="synthetic",
                          choices=("synthetic", "microphone"))
+    p_start.add_argument("--spatial", action="store_true",
+                         help="use physical key positions for the effect")
+    p_start.add_argument("--diagonal", action="store_true",
+                         help="with --spatial, use x+y diagonal (rainbow only)")
+    p_start.add_argument("--real-audio", action="store_true",
+                         help="use real-time Windows audio loopback capture (WASAPI)")
 
     sub.add_parser("stop", help="stop the background animation daemon")
     sub.add_parser("status", help="show animation daemon status")

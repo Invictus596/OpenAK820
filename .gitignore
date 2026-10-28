@@ -31,3 +31,6 @@ desktop.ini
 # Editor
 .vscode/
 .idea/
+
+# Atomic-write temp files
+*.tmp

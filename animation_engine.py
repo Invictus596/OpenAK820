@@ -38,10 +38,12 @@ import json
 import math
 import os
 import random
+import signal
 import subprocess
 import sys
 import threading
 import time
+import warnings
 from ctypes import wintypes
 from pathlib import Path
 from typing import Callable, Optional, Protocol, Sequence
@@ -60,6 +62,16 @@ HEARTBEAT_INTERVAL = 5.0
 DEFAULT_FPS = 30
 MIN_FPS = 1
 MAX_FPS = 60
+
+#: Teardown state: the board is always returned to Static White at UI level 4,
+#: regardless of the animation's brightness, so a dim or bright effect can
+#: never leave the keyboard in a surprising state (P4-T1).
+RESTORE_BRIGHTNESS = 4
+RESTORE_SPEED = 4
+
+#: Below this fraction of mapped LED indices, ``--spatial`` effects warn loudly
+#: and leave unmapped keys unlit instead of guessing (P4-S2).
+SPATIAL_MIN_COVERAGE = 0.90
 
 UNLIT = (0, 0, 18)
 
@@ -357,6 +369,8 @@ class AudioVisualizer(Effect):
 
     def frame(self, t: float) -> bytes:
         raw = self._source.levels(self._bands)
+        if len(raw) < self._bands:  # tolerate short sources instead of shrinking
+            raw = raw + [0.0] * (self._bands - len(raw))
         self._levels = [
             old + (new - old) * (1.0 - self._smoothing)
             for old, new in zip(self._levels, raw)
@@ -375,6 +389,36 @@ class AudioVisualizer(Effect):
         self._source.close()
 
 
+def _spatial_positions(
+    keymap: dict[int, str] | None,
+) -> tuple[dict[int, tuple[float, float]], float]:
+    """Resolve LED indices to normalised positions and report coverage.
+
+    Returns ``(positions, coverage)``.  Coverage is measured against the
+    83 layout keys, NOT all 118 LED slots: the board has physical keys plus
+    underglow/indicator slots that no layout key can ever occupy, so a
+    slot-based ratio could never reach 100 %.  Warns when coverage falls
+    below :data:`SPATIAL_MIN_COVERAGE`; callers must leave unmapped keys
+    unlit rather than guessing (P4-S2) -- a chain-order fallback mixes
+    coordinate systems and renders visual nonsense.
+    """
+    if keymap is None:
+        keymap = h.load_keymap_matrix()
+    positions = layout_75pct.index_positions(keymap)
+    total = len(layout_75pct.LAYOUT_75PCT)
+    coverage = len(positions) / total
+    if coverage < SPATIAL_MIN_COVERAGE:
+        warnings.warn(
+            f"spatial coverage is {coverage:.0%} ({len(positions)}/{total} layout "
+            f"keys, {len(positions)}/{h.KEY_COUNT} LED slots) -- unmapped keys "
+            "stay unlit. Run 'python auto_matrix.py' or 'python matrix_mapper.py' "
+            "to complete the map.",
+            UserWarning,
+            stacklevel=3,
+        )
+    return positions, coverage
+
+
 class SpatialRainbow(Effect):
     """Rainbow wave driven by physical key position rather than LED chain order.
 
@@ -382,8 +426,7 @@ class SpatialRainbow(Effect):
     alone, producing vertical colour stripes that sweep left-to-right.  When
     ``diagonal`` is True the hue uses ``x + y``, giving a diagonal wave.
 
-    Keys that are not present in the spatial map fall back to chain-order
-    positioning (same as :class:`RainbowWave`).
+    Keys without a spatial position stay unlit (never chain-order fallback).
     """
 
     name = "rainbow"
@@ -397,6 +440,7 @@ class SpatialRainbow(Effect):
         diagonal: bool = False,
         saturation: float = 1.0,
         value: float = 1.0,
+        unlit: h.RGB = UNLIT,
     ) -> None:
         self.speed = speed
         self.cycles = cycles
@@ -404,21 +448,19 @@ class SpatialRainbow(Effect):
         self.diagonal = diagonal
         self.saturation = saturation
         self.value = value
+        self._unlit = unlit
 
-        if keymap is None:
-            keymap = h.load_keymap_matrix()
-        self._positions = layout_75pct.index_positions(keymap)
+        self._positions, self.coverage = _spatial_positions(keymap)
 
     def frame(self, t: float) -> bytes:
         keys = []
         for i in range(h.KEY_COUNT):
             pos = self._positions.get(i)
-            if pos is not None:
-                nx, ny = pos
-                coord = (nx + ny) if self.diagonal else nx
-            else:
-                # Fallback: chain-order fraction
-                coord = i / h.KEY_COUNT
+            if pos is None:
+                keys.append(self._unlit)
+                continue
+            nx, ny = pos
+            coord = (nx + ny) if self.diagonal else nx
             hue = coord * self.cycles + t * self.speed * self.direction
             keys.append(_rgb(hue, self.saturation, self.value))
         return h.pack_key_table(keys)
@@ -451,9 +493,7 @@ class SpatialCpuMeter(Effect):
         self._unlit = unlit
         self._load = 0.0
 
-        if keymap is None:
-            keymap = h.load_keymap_matrix()
-        self._positions = layout_75pct.index_positions(keymap)
+        self._positions, self.coverage = _spatial_positions(keymap)
 
     @property
     def load(self) -> float:
@@ -496,17 +536,17 @@ class SpatialAudioVisualizer(Effect):
         unlit: h.RGB = UNLIT,
     ) -> None:
         self._source = source
-        self._bands = bands
+        self._bands = max(1, min(bands, h.KEY_COUNT))
         self._smoothing = max(0.0, min(1.0, smoothing))
         self._unlit = unlit
         self._levels = [0.0] * self._bands
 
-        if keymap is None:
-            keymap = h.load_keymap_matrix()
-        self._positions = layout_75pct.index_positions(keymap)
+        self._positions, self.coverage = _spatial_positions(keymap)
 
     def frame(self, t: float) -> bytes:
         raw = self._source.levels(self._bands)
+        if len(raw) < self._bands:  # tolerate short sources instead of shrinking
+            raw = raw + [0.0] * (self._bands - len(raw))
         self._levels = [
             old + (new - old) * (1.0 - self._smoothing)
             for old, new in zip(self._levels, raw)
@@ -692,16 +732,19 @@ class AnimationEngine:
     def _restore(self, kb: h.AjazzKeyboard) -> None:
         """Teardown: send a static-white frame, sleep, then release the handle.
 
-        The static white frame (``0x07``, mode=STATIC, color=WHITE,
-        brightness=max) switches the keyboard out of Custom Mode so it does
-        not stay frozen on the last animation frame.  The 100 ms sleep gives
-        the firmware time to apply the mode change before the handle is closed.
+        The static white frame (``0x07``, mode=STATIC, color=WHITE) switches
+        the keyboard out of Custom Mode so it does not stay frozen on the last
+        animation frame.  Brightness is a fixed UI level 4 (:data:`RESTORE_BRIGHTNESS`),
+        NOT ``self.brightness`` -- teardown must not inherit the animation's
+        state.  The 100 ms sleep gives the firmware time to apply the mode
+        change before the handle is closed.
         """
         try:
             if self.final == "static":
                 with self._lock:
                     kb.set_lighting(
-                        h.Mode.STATIC, self.brightness, 4, h.Color.WHITE
+                        h.Mode.STATIC, RESTORE_BRIGHTNESS, RESTORE_SPEED,
+                        h.Color.WHITE,
                     )
                 time.sleep(0.1)
                 self._log("restored Static white lighting")
@@ -716,6 +759,51 @@ class AnimationEngine:
                 return
         except Exception as exc:
             self._log(f"could not restore lighting: {exc}")
+
+
+def install_stop_handlers(engine: "AnimationEngine") -> None:
+    """Trap SIGINT/SIGTERM/SIGBREAK so ``_restore()`` always completes.
+
+    Without this, Ctrl+Break (SIGBREAK) or a SIGTERM would kill the process
+    mid-frame and leave the keyboard stuck on the last animation frame.  The
+    handler only flags the engine's stop event; ``run()``'s ``finally`` block
+    does the actual restore, including the 100 ms hold before the handle
+    closes.
+    """
+    def _graceful(signum, frame) -> None:  # noqa: ANN001 - signal API
+        engine.stop()
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _graceful)
+        except (OSError, ValueError):
+            # Some environments (e.g. non-main threads) refuse to install
+            # handlers; the stop-file mechanism remains the fallback.
+            pass
+
+
+def restore_white_reset(log: Callable[[str], None] = _log) -> None:
+    """Send one Static White frame from *this* process and hold 100 ms.
+
+    Used by the daemon supervisor before force-killing a hung child
+    (TerminateProcess is uncatchable, so the child cannot restore itself) and
+    as stale-state recovery.  Mirrors :data:`RESTORE_BRIGHTNESS`/SPEED.
+    """
+    try:
+        with h.open_device() as kb:
+            kb.send(
+                h.build_lighting_packet(
+                    h.Mode.STATIC, RESTORE_BRIGHTNESS, RESTORE_SPEED,
+                    h.Color.WHITE,
+                )
+            )
+            time.sleep(0.1)
+        log("sent Static white reset frame")
+    except Exception as exc:
+        log(f"hardware reset failed: {exc}")
 
 
 # --------------------------------------------------------------------------
@@ -832,11 +920,39 @@ def _cleanup_files() -> None:
             pass
 
 
+def build_daemon_command(
+    effect: str,
+    fps: int = DEFAULT_FPS,
+    brightness: int = h.LEVEL_MAX,
+    audio_source: str = "synthetic",
+    spatial: bool = False,
+    diagonal: bool = False,
+) -> list[str]:
+    """Command line for the detached animation child process."""
+    command = [
+        sys.executable,
+        str(BASE_DIR / "animation_engine.py"),
+        "run",
+        "--effect", effect,
+        "--fps", str(fps),
+        "--brightness", str(brightness),
+        "--audio-source", str(audio_source),
+        "--stop-file", str(STOP_FILE),
+    ]
+    if spatial:
+        command.append("--spatial")
+    if diagonal:
+        command.append("--diagonal")
+    return command
+
+
 def start_daemon(
     effect: str,
     fps: int = DEFAULT_FPS,
     brightness: int = h.LEVEL_MAX,
     audio_source: str = "synthetic",
+    spatial: bool = False,
+    diagonal: bool = False,
     log: Callable[[str], None] = _log,
 ) -> int:
     running, state = daemon_running()
@@ -848,16 +964,9 @@ def start_daemon(
 
     _cleanup_files()
 
-    command = [
-        sys.executable,
-        str(BASE_DIR / "animation_engine.py"),
-        "run",
-        "--effect", effect,
-        "--fps", str(fps),
-        "--brightness", str(brightness),
-        "--audio-source", audio_source,
-        "--stop-file", str(STOP_FILE),
-    ]
+    command = build_daemon_command(
+        effect, fps, brightness, audio_source, spatial=spatial, diagonal=diagonal,
+    )
 
     creationflags = 0
     if sys.platform == "win32":
@@ -884,6 +993,8 @@ def start_daemon(
         "fps": fps,
         "brightness": brightness,
         "audio_source": audio_source,
+        "spatial": spatial,
+        "diagonal": diagonal,
         "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "log": str(LOG_FILE),
     }
@@ -916,7 +1027,11 @@ def stop_daemon(timeout: float = 6.0, log: Callable[[str], None] = _log) -> bool
             break
         time.sleep(0.15)
     else:
+        # The child is hung and will never run its own teardown, and
+        # TerminateProcess is uncatchable -- restore the board from here
+        # BEFORE killing it (P4-T3).
         log(f"pid {pid} did not stop within {timeout:.0f}s; terminating")
+        restore_white_reset(log)
         _terminate(pid)
 
     _cleanup_files()
@@ -989,6 +1104,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         final=args.final,
         stop_file=Path(args.stop_file) if args.stop_file else None,
     )
+    install_stop_handlers(engine)
 
     try:
         engine.run(duration=args.duration)

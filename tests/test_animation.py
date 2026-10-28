@@ -328,6 +328,70 @@ class TestSpatialCpuMeter(unittest.TestCase):
         # That's fine -- it's the boundary pixel.
 
 
+class TestSpatialCoverage(unittest.TestCase):
+    """P4-S2: partial maps warn loudly and never fall back to chain order."""
+
+    def _full_keymap(self) -> dict[int, str]:
+        """Every layout label mapped exactly once; leftover slots as LED<i>."""
+        keymap = {
+            index: label
+            for index, (label, _x, _y) in enumerate(layout_75pct.LAYOUT_75PCT)
+        }
+        for i in range(h.KEY_COUNT):
+            keymap.setdefault(i, f"LED{i}")
+        return keymap
+
+    def test_partial_map_warns(self) -> None:
+        with self.assertWarnsRegex(UserWarning, "spatial coverage"):
+            ae.SpatialRainbow(keymap={15: "Esc", 14: "F1"})
+        with self.assertWarnsRegex(UserWarning, "spatial coverage"):
+            ae.SpatialCpuMeter(keymap={15: "Esc"}, sampler=_FakeSampler(0.3))
+        with self.assertWarnsRegex(UserWarning, "spatial coverage"):
+            ae.SpatialAudioVisualizer(_FakeAudio(), keymap={15: "Esc"})
+
+    def test_full_map_does_not_warn(self) -> None:
+        import warnings as _warnings
+
+        keymap = self._full_keymap()
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error", UserWarning)
+            for cls, kwargs in (
+                (ae.SpatialRainbow, {}),
+                (ae.SpatialCpuMeter, {"sampler": _FakeSampler(0.3)}),
+                (ae.SpatialAudioVisualizer, {"source": _FakeAudio()}),
+            ):
+                effect = cls(keymap=keymap, **kwargs)
+                self.assertEqual(effect.coverage, 1.0, cls.__name__)
+                # A frame must still be a valid full table.
+                self.assertEqual(len(effect.frame(0.0)), h.KEY_TABLE_SIZE)
+
+    def test_rainbow_unmapped_keys_stay_unlit(self) -> None:
+        """No chain-order fallback: unmapped slots are dark, mapped ones lit."""
+        effect = ae.SpatialRainbow(keymap={15: "Esc", 14: "F1"})
+        keys = h.parse_key_table(effect.frame(0.0))
+        self.assertNotEqual(keys[15], ae.UNLIT)   # Esc at nx=0 -> hue 0 (red)
+        self.assertNotEqual(keys[14], ae.UNLIT)
+        for i in range(h.KEY_COUNT):
+            if i not in (14, 15):
+                self.assertEqual(keys[i], ae.UNLIT, i)
+
+    def test_cpu_and_audio_leave_unmapped_unlit(self) -> None:
+        cpu = ae.SpatialCpuMeter(
+            keymap={15: "Esc"}, sampler=_FakeSampler(1.0), smoothing=1.0,
+        )
+        keys = h.parse_key_table(cpu.frame(0.0))
+        for i in range(h.KEY_COUNT):
+            self.assertEqual(keys[i], (ae.UNLIT if i != 15 else keys[15]), i)
+        self.assertNotEqual(keys[15], ae.UNLIT)
+
+    def test_audio_bands_are_clamped(self) -> None:
+        low = ae.SpatialAudioVisualizer(_FakeAudio(), keymap={15: "Esc"}, bands=0)
+        self.assertEqual(low._bands, 1)
+        high = ae.SpatialAudioVisualizer(_FakeAudio(), keymap={15: "Esc"},
+                                         bands=h.KEY_COUNT * 2)
+        self.assertEqual(high._bands, h.KEY_COUNT)
+
+
 class TestCreateEffectFlags(unittest.TestCase):
     """create_effect respects spatial/diagonal flags."""
 
@@ -384,15 +448,107 @@ class TestTeardown(unittest.TestCase):
         self.assertEqual(packet[5], 0x07)             # command = LIGHTING
         self.assertEqual(packet[6], h.Mode.STATIC)    # mode = 0x06
         self.assertEqual(packet[10], h.Color.WHITE)   # color = 0x06
-        self.assertEqual(packet[7], 0x04)             # brightness 5 -> 4
+        self.assertEqual(packet[7], 0x03)             # fixed UI level 4 -> wire 0x03
         # Should have slept ~100ms
         self.assertGreaterEqual(elapsed, 0.08)
+
+    def test_restore_ignores_engine_brightness(self) -> None:
+        """Teardown is always UI level 4, even for a dim or max-bright engine."""
+        for brightness in (h.LEVEL_MIN, 3, h.LEVEL_MAX):
+            engine = ae.AnimationEngine(ae.RainbowWave(), brightness=brightness,
+                                        final="static")
+            keyboard = _FakeKeyboard()
+            engine._restore(keyboard)
+            self.assertEqual(keyboard.sent[0][7], 0x03, brightness)
 
     def test_restore_keep_sends_nothing(self) -> None:
         engine = ae.AnimationEngine(ae.RainbowWave(), final="keep")
         keyboard = _FakeKeyboard()
         engine._restore(keyboard)
         self.assertEqual(len(keyboard.sent), 0)
+
+    def test_install_stop_handlers(self) -> None:
+        """Signal traps flag the engine instead of dying mid-frame."""
+        import signal as _signal
+
+        engine = ae.AnimationEngine(ae.RainbowWave())
+        ae.install_stop_handlers(engine)
+        self.assertFalse(engine._should_stop())
+        engine._stop.set()   # simulate what a trapped SIGINT/SIGTERM does
+        self.assertTrue(engine._should_stop())
+        # Restore default handlers so unittest's own Ctrl+C behaviour is intact.
+        for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+            sig = getattr(_signal, name, None)
+            if sig is not None:
+                _signal.signal(sig, _signal.SIG_DFL)
+
+    def test_stop_daemon_resets_hardware_before_kill(self) -> None:
+        """The force-kill fallback must restore the board itself (P4-T3)."""
+        import unittest.mock
+
+        class _FakeCtx:
+            def __init__(self, kb):
+                self._kb = kb
+
+            def __enter__(self):
+                return self._kb
+
+            def __exit__(self, *exc):
+                return False
+
+        class _FakeHid:
+            def __init__(self):
+                self.sent = []
+
+            def __call__(self, **kwargs):
+                return _FakeCtx(self)
+
+            def send(self, packet):
+                self.sent.append(packet)
+                return len(packet)
+
+        fake = _FakeHid()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            stopf = Path(tmp) / "stop.flag"
+            state.write_text('{"pid": 424242}', encoding="utf-8")
+            orig = (ae.STATE_FILE, ae.STOP_FILE)
+            ae.STATE_FILE, ae.STOP_FILE = state, stopf
+            try:
+                with unittest.mock.patch.object(ae, "_pid_alive", lambda pid: True), \
+                     unittest.mock.patch.object(ae, "_pid_is_python", lambda pid: True), \
+                     unittest.mock.patch.object(ae, "_terminate") as terminate, \
+                     unittest.mock.patch.object(ae.time, "sleep"), \
+                     unittest.mock.patch.object(ae.h, "open_device", fake):
+                    ae.stop_daemon(timeout=0.2)
+            finally:
+                ae.STATE_FILE, ae.STOP_FILE = orig
+
+        self.assertTrue(terminate.called)
+        self.assertEqual(len(fake.sent), 1)
+        self.assertEqual(fake.sent[0][5], 0x07)
+        self.assertEqual(fake.sent[0][6], h.Mode.STATIC)
+
+
+class TestDaemonForwarding(unittest.TestCase):
+    """P4-S6: the supervisor forwards spatial flags to the child process."""
+
+    def test_command_includes_spatial_flags(self) -> None:
+        cmd = ae.build_daemon_command("rainbow", spatial=True, diagonal=True)
+        self.assertIn("--spatial", cmd)
+        self.assertIn("--diagonal", cmd)
+
+    def test_command_without_flags(self) -> None:
+        cmd = ae.build_daemon_command("cpu")
+        self.assertNotIn("--spatial", cmd)
+        self.assertNotIn("--diagonal", cmd)
+
+    def test_diagonal_is_ignored_off_rainbow(self) -> None:
+        cpu = ae.create_effect("cpu", spatial=True, diagonal=True)
+        self.assertIsInstance(cpu, ae.SpatialCpuMeter)
+        audio = ae.create_effect("audio", spatial=True, diagonal=True)
+        self.assertIsInstance(audio, ae.SpatialAudioVisualizer)
+        audio.close()
 
 
 if __name__ == "__main__":
