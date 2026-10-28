@@ -31,11 +31,13 @@ from __future__ import annotations
 import argparse
 import ctypes
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
 
 import ajazz_hid as h
+import mapper_common
 
 try:
     import msvcrt  # noqa: F401 - Windows only; guarded for imports elsewhere
@@ -126,9 +128,30 @@ def held_modifiers() -> set[str]:
     return out
 
 
-def _probe(kb: h.AjazzKeyboard, index: int, colour: h.RGB, delay: float) -> None:
-    """Light one slot and black out the rest."""
-    kb.send_keymap(h.build_key_table({index: colour}), delay=delay)
+def _probe(
+    kb: h.AjazzKeyboard,
+    index: int,
+    colour: h.RGB,
+    delay: float,
+    *,
+    lock: threading.Lock,
+    brightness: int,
+    enter_custom: bool,
+) -> None:
+    """Light one slot and black out the rest.
+
+    Custom Mode is re-asserted for every probe (:mod:`mapper_common`), because
+    the firmware leaves it after an idle period -- the cause of probes that
+    flashed for a frame and reverted to Static White mid-session.
+    """
+    mapper_common.probe(
+        kb,
+        h.build_key_table({index: colour}),
+        lock,
+        brightness=brightness,
+        delay=delay,
+        enter_custom=enter_custom,
+    )
 
 
 def _banner(index: int, mapping: dict[int, str]) -> None:
@@ -164,21 +187,40 @@ def _read_keypress(timeout: float) -> tuple[Optional[str], bool]:
     return None, False
 
 
-def _finish(kb: h.AjazzKeyboard, args: argparse.Namespace) -> None:
-    """Leave the keyboard in a predictable state (mirrors matrix_mapper)."""
+def _finish(
+    kb: h.AjazzKeyboard,
+    args: argparse.Namespace,
+    lock: Optional[threading.Lock] = None,
+) -> None:
+    """Leave the keyboard in a predictable state (mirrors matrix_mapper).
+
+    ``fill`` drives the built-in Static White effect instead of an all-white
+    table, because the firmware rejects full-board high-intensity tables
+    (measured 2026-10-28).  An all-zero table *is* accepted, so ``off`` stays
+    table-based.
+    """
     if args.final == "keep":
         return
     if args.final == "fill":
-        kb.send_keymap(h.pack_key_table([(255, 255, 255)] * h.KEY_COUNT),
-                       delay=args.delay)
-        print("Keyboard left in Custom Mode with all keys lit white.")
+        kb.set_lighting(
+            h.Mode.STATIC, args.brightness, mapper_common.RESTORE_SPEED,
+            h.Color.WHITE,
+        )
+        time.sleep(mapper_common.RESTORE_HOLD)
+        print(f"Keyboard left on Static White (level {args.brightness}).")
     elif args.final == "off":
-        kb.send_keymap(h.pack_key_table([(0, 0, 0)] * h.KEY_COUNT), delay=args.delay)
+        mapper_common.probe(
+            kb, h.pack_key_table([(0, 0, 0)] * h.KEY_COUNT),
+            lock or threading.Lock(), brightness=args.brightness,
+            delay=args.delay, enter_custom=args.enter_custom,
+        )
         print("Keyboard left in Custom Mode with all keys off.")
     elif args.final == "static":
-        kb.set_lighting(h.Mode.STATIC, 4, 4, h.Color.WHITE)
-        time.sleep(0.1)
-        print("Keyboard returned to Static White (level 4).")
+        mapper_common.restore_static_white(kb, lock)
+        print(
+            "Keyboard returned to Static White "
+            f"(level {mapper_common.RESTORE_BRIGHTNESS})."
+        )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -212,6 +254,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--path", help="explicit HID interface path")
     parser.add_argument("--list", action="store_true",
                         help="print the saved mapping and exit")
+    parser.add_argument("--force", action="store_true",
+                        help="start even if the animation daemon cannot be stopped")
     args = parser.parse_args(argv)
 
     try:
@@ -252,49 +296,63 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     colour = PROBE_COLOURS[args.color]
     saved = 0
+    lock = threading.Lock()
+
     try:
+        mapper_common.preflight(stop_running=not args.force)
+    except mapper_common.MapperPreflightError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+
+    try:
+        # ONE handle for the whole session: no per-probe open/close, so no
+        # teardown frame can be emitted between probes.
         with h.open_device(path=args.path) as kb:
-            if args.enter_custom:
-                kb.enter_custom_mode(brightness=args.brightness)
             print(f"Device: {kb.info.path}")
 
-            for index in range(start, h.KEY_COUNT):
-                if index in mapping:
-                    continue
-                if index in skip:
-                    mapping[index] = f"LED{index}"
+            with mapper_common.Keepalive(kb, lock):
+                if args.enter_custom:
+                    kb.enter_custom_mode(brightness=args.brightness)
+
+                for index in range(start, h.KEY_COUNT):
+                    if index in mapping:
+                        continue
+                    if index in skip:
+                        mapping[index] = f"LED{index}"
+                        h.save_keymap_matrix(mapping, args.output)
+                        print(f"  index {index}: skipped -> LED{index}")
+                        continue
+
+                    _probe(kb, index, colour, args.delay, lock=lock,
+                           brightness=args.brightness,
+                           enter_custom=args.enter_custom)
+                    _banner(index, mapping)
+
+                    label, _aborted = _read_keypress(args.timeout)
+                    if label is None:
+                        label = f"LED{index}"
+                        print(f"  (no keypress) -> recorded as LED{index}")
+                    else:
+                        print(f"  detected key: {label!r}")
+
+                    clash = [
+                        other for other, value in mapping.items()
+                        if other != index and value.casefold() == label.casefold()
+                    ]
+                    if clash:
+                        print(f"  ! {label!r} is already used by index {clash[0]}; "
+                              f"recording {index} as UNCHECKED_{label} - fix it with "
+                              "'python matrix_mapper.py --start "
+                              f"{min(index, clash[0])}'")
+                        label = f"UNCHECKED_{label}"
+
+                    mapping[index] = label
                     h.save_keymap_matrix(mapping, args.output)
-                    print(f"  index {index}: skipped -> LED{index}")
-                    continue
+                    saved += 1
+                    if index == h.KEY_COUNT - 1:
+                        print("\nReached the end of the table.")
 
-                _probe(kb, index, colour, args.delay)
-                _banner(index, mapping)
-
-                label, _aborted = _read_keypress(args.timeout)
-                if label is None:
-                    label = f"LED{index}"
-                    print(f"  (no keypress) -> recorded as LED{index}")
-                else:
-                    print(f"  detected key: {label!r}")
-
-                clash = [
-                    other for other, value in mapping.items()
-                    if other != index and value.casefold() == label.casefold()
-                ]
-                if clash:
-                    print(f"  ! {label!r} is already used by index {clash[0]}; "
-                          f"recording {index} as UNCHECKED_{label} - fix it with "
-                          "'python matrix_mapper.py --start "
-                          f"{min(index, clash[0])}'")
-                    label = f"UNCHECKED_{label}"
-
-                mapping[index] = label
-                h.save_keymap_matrix(mapping, args.output)
-                saved += 1
-                if index == h.KEY_COUNT - 1:
-                    print("\nReached the end of the table.")
-
-            _finish(kb, args)
+                _finish(kb, args, lock)
 
     except h.AjazzError as exc:
         print(f"error: {exc}", file=sys.stderr)

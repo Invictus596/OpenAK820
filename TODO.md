@@ -6,7 +6,7 @@ wire format lives in [PROTOCOL.md](PROTOCOL.md).
 **Legend:** `[x]` done and verified · `[~]` implemented, not yet verified on hardware ·
 `[ ]` not started · `[!]` blocked
 
-**Last audit:** 2026-10-27 · 82 tests passing · device VID `0x1A2C` / PID `0xA036` / `MI_00` usage page `0xFF02`
+**Last audit:** 2026-10-28 · 99 tests passing · device VID `0x1A2C` / PID `0xA036` / `MI_00` usage page `0xFF02`
 
 ---
 
@@ -21,18 +21,16 @@ Status: **code complete, data-blocked, hardware verification pending.**
 - [x] `final="static" | "off" | "keep"` modes; `off` also sleeps 100 ms.
 - [x] `tray_service.exit_clean()` stops the engine thread, writes Static White, sleeps 100 ms.
 - [x] Unit tests assert opcode/mode/colour and the ≥80 ms delay.
-- [ ] **P4-T1 — pin teardown brightness to level 4.** `_restore()` currently reuses
-      `self.brightness`, so an engine started at level 1 restores *dim* white and level 5
-      restores wire `0x04`. `tray_service` already uses 4; the engine must match.
-      Accept: `AnimationEngine(..., brightness=1)._restore()` still emits brightness `0x03`.
+- [x] **P4-T1 — pin teardown brightness to level 4.** `_restore()` now uses fixed
+      `RESTORE_BRIGHTNESS=4` / `RESTORE_SPEED=4` regardless of `self.brightness`.
+      Tested: engine at levels 1/3/5 all restore wire `0x03`.
 - [ ] **P4-T2 — retry the restore frame.** One frame occasionally loses the race with
       handle close (observed on this board). Send up to 3 frames 150 ms apart, then hold
       100 ms. Accept: stuck-rainbow incident cannot recur in a 20-cycle start/stop soak.
-- [ ] **P4-T3 — restore on abnormal exit.** `atexit` + `SIGINT`/`SIGBREAK` handler in the
-      foreground path. The daemon's 6 s force-kill path (`TerminateProcess`) bypasses
-      `_restore()`; before terminating, the *parent* must open the device and send the
-      reset frame itself, then wait 100 ms. Accept: `cli.py stop` after a hung child leaves
-      the board white, never on the last animation frame.
+- [x] **P4-T3 — restore on abnormal exit.** `install_stop_handlers()` traps
+      SIGINT/SIGTERM/SIGBREAK and flags the engine so `run()`'s `finally` restores.
+      The daemon supervisor now calls `restore_white_reset()` *before* force-killing a
+      hung child (TerminateProcess is uncatchable). Tested with mocked HID/PID.
 - [ ] **P4-T4 — stale-state recovery.** On daemon/tray start, if `.ajazz_anim.json` points
       at a dead PID, send a reset frame before accepting new work.
 
@@ -62,20 +60,25 @@ Status: **code complete, data-blocked, hardware verification pending.**
       most 2 keys; `SpatialRainbow` fills the other 116 from LED-chain order, which mixes two
       coordinate systems and looks like a chain effect, not a spatial one. There is no way to
       derive the map from the layout — it must be measured.
-      Accept: ≥116/118 indices resolved; every `LAYOUT_75PCT` label appears exactly once;
-      remaining indices documented as underglow/indicator.
-- [ ] **P4-S2 — spatial coverage guard.** Warn (and optionally refuse) when coverage is
-      below e.g. 90 %, printing `mapped N/118 — run matrix_mapper.py`. Never silently fall
-      back to chain order inside a `--spatial` effect.
-- [ ] **P4-S3 — unmapped-key policy.** For partial maps, either leave unmapped slots unlit or
-      snap them to the nearest mapped neighbour. Pick one and test it.
-- [ ] **P4-S4 — `--diagonal` on non-rainbow effects.** CPU/audio currently accept the flag and
-      ignore it. Reject with a clear message, or define diagonal semantics for them.
-- [ ] **P4-S5 — band clamping in `SpatialAudioVisualizer`.** It does not clamp `bands` the way
-      `AudioVisualizer` does; `bands=0` divides by zero. Clamp to `1..KEY_COUNT`.
-- [ ] **P4-S6 — daemon parity.** `cli.py start` has no `--spatial`, `--diagonal` or
-      `--real-audio`, and `start_daemon()` does not forward them, so the background daemon
-      can never run a spatial effect. Forward and persist them in `.ajazz_anim.json`.
+      **Tooling ready:** `auto_matrix.py` lights one slot at a time and identifies the key
+      from the keypress itself (modifiers focus-free via GetAsyncKeyState, printable keys via
+      console scancodes, non-key slots recorded as `LED<n>` on timeout). Session ≈ 2–5 min.
+      Accept: every `LAYOUT_75PCT` label appears exactly once; remaining slots documented
+      as underglow/indicator (`LED<n>`); positions refreshed via `layout_75pct.py`.
+- [x] **P4-S2 — spatial coverage guard.** `_spatial_positions()` warns below
+      `SPATIAL_MIN_COVERAGE` (90 %); all three spatial effects leave unmapped keys **unlit**
+      — the chain-order fallback is gone. Coverage is measured against the 83 layout keys
+      (a slot-based ratio could never reach 90 %: 118 slots ≠ 83 keys).
+- [x] **P4-S3 — unmapped-key policy.** Chosen: unlit (drop). No coordinate mixing.
+- [x] **P4-S4 — `--diagonal` on non-rainbow effects.** `create_effect` ignores it for
+      CPU/audio; `cli.py` prints an explicit `note:` line instead of failing silently.
+- [x] **P4-S5 — band clamping in `SpatialAudioVisualizer`.** Clamped to `1..KEY_COUNT`
+      like `AudioVisualizer`; both audio effects also tolerate sources that return fewer
+      bands than requested (zip truncation IndexError fixed).
+- [x] **P4-S6 — daemon parity.** `cli.py start` gained `--spatial`, `--diagonal` and
+      `--real-audio`; `start_daemon()` forwards them via `build_daemon_command()` and
+      persists them in `.ajazz_anim.json`. Verified on hardware: `start cpu --spatial`
+      ran the spatial effect and restored white on stop.
 - [ ] **P4-S7 — hardware verification.** Run `python cli.py effect rainbow --spatial` and
       confirm the gradient sweeps left→right in desk space (not Esc→Del chain order), then
       repeat with `--diagonal`. **Cannot be judged until P4-S1 is done.**
@@ -85,9 +88,12 @@ Status: **code complete, data-blocked, hardware verification pending.**
 
 ### 4.4 Test baseline
 
-- [x] 82 tests green. The stale `test_audio_ignores_spatial` (asserted audio ignores
+- [x] 99 tests green (was 82). The stale `test_audio_ignores_spatial` (asserted audio ignores
       `--spatial`, contradicting the new `SpatialAudioVisualizer`) was replaced with
-      `test_spatial_audio` + `test_non_spatial_audio`.
+      `test_spatial_audio` + `test_non_spatial_audio`. New coverage: teardown level pin,
+      signal handlers, supervisor reset-before-kill, coverage guard, unmapped-key drop,
+      band clamping, short-audio-source tolerance, daemon flag forwarding, and the
+      `auto_matrix.py` scancode decode tables.
 
 ---
 
@@ -213,9 +219,10 @@ Goal: one profile format and one UI codebase across browser and desktop.
 
 ## Immediate next actions
 
-1. **P4-S1** — run `matrix_mapper.py` and map the remaining 116 indices. Everything spatial
-   depends on it.
-2. **P4-T1/T2** — fixed level-4 teardown + 3× retry; soak test.
-3. **P4-S2** — coverage guard so `--spatial` can never mislead.
+1. **P4-S1** — run the `auto_matrix.py` session (≈2–5 min at the keyboard; press each lit
+   key, wait out non-key slots). Everything spatial depends on it.
+2. **P4-S7** — verify `--spatial` and `--diagonal` visually on hardware once the map is
+   complete; record results in `PROTOCOL.md` §4 (P4-S9).
+3. **P4-T2/T4** — teardown retry + stale-state recovery, then the 20-cycle soak (P4-S8).
 4. **P5-1/P5-2** — protocol core + WebHID device layer against byte vectors.
-5. **P6-1** — finish teardown before adding more daemon features.
+5. **P6-1** — remaining teardown hardening before adding more daemon features.

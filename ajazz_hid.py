@@ -91,13 +91,21 @@ class Command(IntEnum):
     """Opcode carried at buffer offset ``[5]``."""
 
     LIGHTING = 0x07        #: lighting configuration (this module)
+    MODE_ARM_B = 0x09      #: second Custom-Mode arm frame (measured, see below)
     KEYMAP_COMMIT = 0x0A   #: commit the per-key RGB table (Phase 2)
+    MODE_ARM_A = 0x0B      #: first Custom-Mode arm frame (measured, see below)
     KEEPALIVE = 0x0E       #: periodic heartbeat, ~5.02 s
     KEYMAP_CHUNK_BASE = 0xF6  #: 0xF6..0xFB carry the per-key table (Phase 2)
 
 
 class Mode(IntEnum):
-    """Lighting mode, offset ``[6]`` (0-based index into the UI list)."""
+    """Lighting mode, offset ``[6]``.
+
+    These are wire values, not positions in the vendor UI list.  ``CUSTOM`` is
+    ``0x17``: captured from ``DeviceDriver.exe`` on 2026-10-28 when the app was
+    switched back to the per-key page.  The previously assumed ``18`` sends an
+    *animated* effect (rainbow on this firmware), never the uploaded table.
+    """
 
     LEFT_RIGHT_RIPPLES = 0
     STARRY_DOTS = 1
@@ -117,7 +125,7 @@ class Mode(IntEnum):
     GALLOPING_HORSE = 15
     MUSIC_RHYTHM = 16
     SCREEN_RHYTHM = 17
-    CUSTOM = 18
+    CUSTOM = 0x17
 
 
 class Color(IntEnum):
@@ -170,7 +178,7 @@ def build_lighting_packet(
         [0]     0x00                     report ID
         [1..4]  AA 55 CC 33              magic
         [5]     0x07                     command
-        [6]     mode                     0x00..0x12
+        [6]     mode                     0x00..0x17
         [7]     brightness - 1           0x00..0x04
         [8]     speed - 1                0x00..0x04
         [9]     variant                  mode specific (0, or 1 for Kaleidoscope)
@@ -295,12 +303,17 @@ def build_commit_packet() -> bytes:
     return bytes((REPORT_ID,)) + bytes(payload)
 
 
-def build_keepalive_packet() -> bytes:
-    """The ``0x0E`` heartbeat: header + opcode, everything else zero."""
+def build_opcode_packet(command: Command | int) -> bytes:
+    """Header + opcode, everything else zero (``0x09``, ``0x0A``, ``0x0B``, ``0x0E``)."""
     payload = bytearray(REPORT_SIZE - 1)
     payload[0:4] = MAGIC
-    payload[4] = Command.KEEPALIVE
+    payload[4] = int(command)
     return bytes((REPORT_ID,)) + bytes(payload)
+
+
+def build_keepalive_packet() -> bytes:
+    """The ``0x0E`` heartbeat: header + opcode, everything else zero."""
+    return build_opcode_packet(Command.KEEPALIVE)
 
 
 # --------------------------------------------------------------------------
@@ -419,14 +432,25 @@ class AjazzKeyboard:
         self,
         brightness: int = LEVEL_MAX,
         speed: int = 4,
+        color: Color | int = Color.CUSTOM,
     ) -> int:
-        """Ask the keyboard to display the per-key table.
+        """Ask the keyboard to display the uploaded per-key table.
 
-        Custom Mode is mode index 18.  The vendor UI never emits this frame while
-        the Custom tab is open, but issuing it before an upload makes the table
-        visible when the device was showing a built-in effect.
+        Measured against the vendor app on 2026-10-28; the app emits exactly::
+
+            0x07  mode=0x17 brightness speed variant=0 color=7
+            0x0B  (empty)
+            0x09  (empty)
+            ... then the ``0xF6``..``0xFB`` table and, later, ``0x0A``
+
+        All three frames are required: ``0x07 mode=0x17`` alone leaves the board
+        animating, and the table is ignored until the two arm frames follow.
+        Returns the number of bytes accepted.
         """
-        return self.set_lighting(Mode.CUSTOM, brightness, speed, Color.CUSTOM)
+        total = self.set_lighting(Mode.CUSTOM, brightness, speed, color)
+        total += self.send(build_opcode_packet(Command.MODE_ARM_A))
+        total += self.send(build_opcode_packet(Command.MODE_ARM_B))
+        return total
 
 
 class BaseBackend:
