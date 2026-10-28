@@ -1,0 +1,124 @@
+{
+  "format": 1,
+  "profiles": [
+    {
+      "name": "Static White",
+      "description": "Clean static white backlighting across all keys (default safe mode).",
+      "kind": "built-in",
+      "mode": "static",
+      "brightness": 5,
+      "speed": 4,
+      "color": "white",
+      "variant": 0,
+      "custom_keys": {},
+      "effect_fps": 30,
+      "spatial": false,
+      "diagonal": false,
+      "audio_source": "wasapi"
+    },
+    {
+      "name": "WASD Gaming",
+      "description": "Red WASD cluster, blue directional arrow keys, all other keys unlit.",
+      "kind": "custom",
+      "mode": "custom",
+      "brightness": 5,
+      "speed": 4,
+      "color": "custom",
+      "variant": 0,
+      "custom_keys": {
+        "W": [
+          255,
+          0,
+          0
+        ],
+        "A": [
+          255,
+          0,
+          0
+        ],
+        "S": [
+          255,
+          0,
+          0
+        ],
+        "D": [
+          255,
+          0,
+          0
+        ],
+        "Up": [
+          0,
+          0,
+          255
+        ],
+        "Down": [
+          0,
+          0,
+          255
+        ],
+        "Left": [
+          0,
+          0,
+          255
+        ],
+        "Right": [
+          0,
+          0,
+          255
+        ]
+      },
+      "effect_fps": 30,
+      "spatial": false,
+      "diagonal": false,
+      "audio_source": "wasapi"
+    },
+    {
+      "name": "Spatial Rainbow Wave",
+      "description": "Smooth real-time rainbow wave traveling across physical columns x in [0..21].",
+      "kind": "effect",
+      "mode": "static",
+      "brightness": 5,
+      "speed": 4,
+      "color": "white",
+      "variant": 0,
+      "custom_keys": {},
+      "effect_name": "rainbow",
+      "effect_fps": 30,
+      "spatial": true,
+      "diagonal": false,
+      "audio_source": "wasapi"
+    },
+    {
+      "name": "Audio Visualizer",
+      "description": "Real-time WASAPI audio frequency spectrum equalizer mapped across visual columns.",
+      "kind": "effect",
+      "mode": "static",
+      "brightness": 5,
+      "speed": 4,
+      "color": "white",
+      "variant": 0,
+      "custom_keys": {},
+      "effect_name": "audio",
+      "effect_fps": 30,
+      "spatial": true,
+      "diagonal": false,
+      "audio_source": "wasapi"
+    },
+    {
+      "name": "CPU Load Monitor",
+      "description": "System CPU utilization as a left-to-right fill bar (green to red).",
+      "kind": "effect",
+      "mode": "static",
+      "brightness": 5,
+      "speed": 4,
+      "color": "white",
+      "variant": 0,
+      "custom_keys": {},
+      "effect_name": "cpu",
+      "effect_fps": 20,
+      "spatial": true,
+      "diagonal": false,
+      "audio_source": "wasapi"
+    }
+  ]
+}

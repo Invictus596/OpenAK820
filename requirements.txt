@@ -16,7 +16,11 @@
 # PyQt6>=6.6
 # pyinstaller>=6.0
 
-# Phase 3 audio visualiser, optional. The engine runs without these; only
-# `cli.py effect audio --audio-source microphone` needs them.
-# numpy>=1.26
-# sounddevice>=0.4
+# Phase 3 audio visualiser: numpy + sounddevice power the WASAPI loopback
+# analyser in audio_source.py (installed in .venv).
+numpy>=1.26
+sounddevice>=0.4
+
+# Phase 6 system-tray service (tray_service.py):
+pystray>=0.19
+Pillow>=10.0
