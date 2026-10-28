@@ -268,6 +268,10 @@ def _list_effects() -> int:
         "  python cli.py effect rainbow --fps 30\n"
         "  python cli.py effect cpu\n"
         "  python cli.py effect audio --audio-source synthetic\n"
+        "\nSpatial effects (use physical key positions):\n"
+        "  python cli.py effect rainbow --spatial\n"
+        "  python cli.py effect rainbow --spatial --diagonal\n"
+        "  python cli.py effect cpu --spatial\n"
         "\nRun one in the background:\n"
         "  python cli.py start rainbow\n"
         "  python cli.py status\n"
@@ -284,7 +288,18 @@ def _run_effect(args: argparse.Namespace) -> int:
         print(f"unknown effect {args.name!r}; choose from: {', '.join(EFFECTS)}", file=sys.stderr)
         return 2
 
-    effect = create_effect(args.name, audio_source=args.audio_source)
+    spatial = getattr(args, "spatial", False)
+    diagonal = getattr(args, "diagonal", False)
+    audio_source_name = getattr(args, "audio_source", "synthetic")
+    if getattr(args, "real_audio", False):
+        audio_source_name = "wasapi"
+
+    effect = create_effect(
+        args.name,
+        audio_source=audio_source_name,
+        spatial=spatial,
+        diagonal=diagonal,
+    )
 
     if args.dry_run:
         table = effect.frame(0.0)
@@ -304,6 +319,8 @@ def _run_effect(args: argparse.Namespace) -> int:
     )
 
     print(f"effect: {args.name}  fps: {args.fps}  (Ctrl+C to stop)")
+    if spatial:
+        print(f"  spatial mode: {'diagonal (x+y)' if diagonal else 'column (x)'}")
     try:
         engine.run(duration=args.duration)
     except KeyboardInterrupt:
@@ -340,6 +357,84 @@ def _stop_daemon() -> int:
 def _daemon_status() -> int:
     print(daemon_status())
     return 0
+
+
+def _handle_profile(args: argparse.Namespace) -> int:
+    from profile_manager import ProfileManager, LightingProfile
+    mgr = ProfileManager()
+
+    action = getattr(args, "profile_action", "list")
+    if action == "list" or not action:
+        profiles = mgr.list_profiles()
+        print(f"Available profiles ({len(profiles)}):\n")
+        for p in profiles:
+            kind_info = f"kind={p.kind}"
+            if p.kind == "effect":
+                kind_info += f", effect={p.effect_name}"
+            elif p.kind == "custom":
+                kind_info += f", keys={len(p.custom_keys)}"
+            else:
+                kind_info += f", mode={p.mode}, color={p.color}"
+            print(f"  * {p.name:<24} [{kind_info}]")
+            if p.description:
+                print(f"      {p.description}")
+        return 0
+
+    if action == "save":
+        name = args.profile_name
+        if not name:
+            print("error: profile name required for save", file=sys.stderr)
+            return 2
+        # Save a new profile using command-line arguments or defaults
+        prof = LightingProfile(
+            name=name,
+            description=getattr(args, "desc", "") or f"User saved profile '{name}'",
+            kind=getattr(args, "kind", "built-in"),
+            mode=getattr(args, "mode", "static"),
+            color=getattr(args, "color", "white"),
+            brightness=getattr(args, "brightness", LEVEL_MAX),
+            speed=getattr(args, "speed", 4),
+            effect_name=getattr(args, "effect", None),
+            spatial=getattr(args, "spatial", False),
+        )
+        mgr.save_profile(prof)
+        print(f"Saved profile '{name}' to {mgr.path}")
+        return 0
+
+    if action == "load":
+        name = args.profile_name
+        if not name:
+            print("error: profile name required for load", file=sys.stderr)
+            return 2
+        prof = mgr.get(name)
+        if not prof:
+            print(f"error: profile '{name}' not found", file=sys.stderr)
+            return 2
+        print(f"Applying profile: {prof.name} ({prof.kind})")
+        from tray_service import TrayService
+        srv = TrayService()
+        srv.apply_profile(prof)
+        print(f"Profile '{prof.name}' applied successfully.")
+        return 0
+
+    if action == "delete":
+        name = args.profile_name
+        if not name:
+            print("error: profile name required for delete", file=sys.stderr)
+            return 2
+        if mgr.delete_profile(name):
+            print(f"Deleted profile '{name}'")
+            return 0
+        else:
+            print(f"Profile '{name}' not found", file=sys.stderr)
+            return 2
+
+    return 0
+
+
+def _run_tray() -> int:
+    import tray_service
+    return tray_service.main()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -403,6 +498,12 @@ def main(argv: list[str] | None = None) -> int:
                           choices=("synthetic", "microphone"))
     p_effect.add_argument("--final", default="static", choices=("static", "off", "keep"),
                           help="lighting state on exit (default: static)")
+    p_effect.add_argument("--spatial", action="store_true",
+                          help="use physical key positions for rainbow/cpu/audio effects")
+    p_effect.add_argument("--diagonal", action="store_true",
+                          help="with --spatial, use x+y diagonal (rainbow only)")
+    p_effect.add_argument("--real-audio", action="store_true",
+                          help="use real-time Windows audio loopback capture (WASAPI)")
 
     p_start = sub.add_parser("start", help="start an effect as a background daemon")
     p_start.add_argument("name", choices=EFFECTS, metavar="NAME")
@@ -415,12 +516,32 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("stop", help="stop the background animation daemon")
     sub.add_parser("status", help="show animation daemon status")
+    sub.add_parser("tray", help="launch the Windows system tray background service")
+
+    p_prof = sub.add_parser("profile", help="manage lighting profiles (list/save/load/delete)")
+    p_prof.add_argument("profile_action", nargs="?", default="list", choices=("list", "save", "load", "delete"),
+                        metavar="ACTION")
+    p_prof.add_argument("profile_name", nargs="?", default=None, metavar="NAME")
+    p_prof.add_argument("--kind", default="built-in", choices=("built-in", "custom", "effect"))
+    p_prof.add_argument("--mode", default="static")
+    p_prof.add_argument("--color", default="white")
+    p_prof.add_argument("--effect", default=None)
+    p_prof.add_argument("--brightness", type=int, default=LEVEL_MAX)
+    p_prof.add_argument("--speed", type=int, default=4)
+    p_prof.add_argument("--spatial", action="store_true")
+    p_prof.add_argument("--desc", default="")
 
     args = parser.parse_args(argv)
 
     try:
         if args.cmd == "list":
             return _print_devices()
+
+        if args.cmd == "tray":
+            return _run_tray()
+
+        if args.cmd == "profile":
+            return _handle_profile(args)
 
         if args.cmd == "static-cyan":
             packet = static_cyan_packet(args.brightness, args.speed)

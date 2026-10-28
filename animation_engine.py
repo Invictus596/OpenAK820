@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Callable, Optional, Protocol, Sequence
 
 import ajazz_hid as h
+import layout_75pct
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -325,10 +326,14 @@ def open_audio_source(kind: str) -> AudioSource:
     kind = kind.lower()
     if kind == "synthetic":
         return SyntheticAudioSource()
-    if kind == "microphone":
-        return MicrophoneAudioSource()
+    if kind in ("wasapi", "real", "real-audio", "loopback", "microphone"):
+        try:
+            import audio_source
+            return audio_source.get_audio_source("wasapi")
+        except Exception:
+            return MicrophoneAudioSource()
     raise h.AjazzError(
-        f"unknown audio source {kind!r}; choose synthetic or microphone"
+        f"unknown audio source {kind!r}; choose synthetic, wasapi, or microphone"
     )
 
 
@@ -370,17 +375,187 @@ class AudioVisualizer(Effect):
         self._source.close()
 
 
+class SpatialRainbow(Effect):
+    """Rainbow wave driven by physical key position rather than LED chain order.
+
+    When ``diagonal`` is False the hue is based on the normalised X coordinate
+    alone, producing vertical colour stripes that sweep left-to-right.  When
+    ``diagonal`` is True the hue uses ``x + y``, giving a diagonal wave.
+
+    Keys that are not present in the spatial map fall back to chain-order
+    positioning (same as :class:`RainbowWave`).
+    """
+
+    name = "rainbow"
+
+    def __init__(
+        self,
+        keymap: dict[int, str] | None = None,
+        speed: float = 0.35,
+        cycles: float = 2.0,
+        direction: int = 1,
+        diagonal: bool = False,
+        saturation: float = 1.0,
+        value: float = 1.0,
+    ) -> None:
+        self.speed = speed
+        self.cycles = cycles
+        self.direction = 1 if direction >= 0 else -1
+        self.diagonal = diagonal
+        self.saturation = saturation
+        self.value = value
+
+        if keymap is None:
+            keymap = h.load_keymap_matrix()
+        self._positions = layout_75pct.index_positions(keymap)
+
+    def frame(self, t: float) -> bytes:
+        keys = []
+        for i in range(h.KEY_COUNT):
+            pos = self._positions.get(i)
+            if pos is not None:
+                nx, ny = pos
+                coord = (nx + ny) if self.diagonal else nx
+            else:
+                # Fallback: chain-order fraction
+                coord = i / h.KEY_COUNT
+            hue = coord * self.cycles + t * self.speed * self.direction
+            keys.append(_rgb(hue, self.saturation, self.value))
+        return h.pack_key_table(keys)
+
+
+class SpatialCpuMeter(Effect):
+    """CPU load as a horizontal bar filling left-to-right across physical columns.
+
+    Keys are grouped by their normalised X coordinate.  At 50 % load the bar
+    fills the left half of the keyboard; at 100 % every column is lit.  Colour
+    transitions from green (low load, left edge) to red (high load, right edge).
+
+    Keys without a spatial position are left at ``unlit``.
+    """
+
+    name = "cpu"
+
+    def __init__(
+        self,
+        keymap: dict[int, str] | None = None,
+        sampler: Optional["_CpuSampler"] = None,
+        smoothing: float = 0.25,
+        sample_interval: float = 0.25,
+        unlit: h.RGB = UNLIT,
+    ) -> None:
+        self._sampler = sampler or _CpuSampler()
+        self._smoothing = max(0.0, min(1.0, smoothing))
+        self._sample_interval = max(0.01, sample_interval)
+        self._next_sample = 0.0
+        self._unlit = unlit
+        self._load = 0.0
+
+        if keymap is None:
+            keymap = h.load_keymap_matrix()
+        self._positions = layout_75pct.index_positions(keymap)
+
+    @property
+    def load(self) -> float:
+        return self._load
+
+    def frame(self, t: float) -> bytes:
+        if t >= self._next_sample:
+            level = self._sampler.sample()
+            self._next_sample = t + self._sample_interval
+            if self._smoothing:
+                self._load += (level - self._load) * self._smoothing
+            else:
+                self._load = level
+
+        keys: list[h.RGB] = [self._unlit] * h.KEY_COUNT
+        for idx, (nx, _ny) in self._positions.items():
+            if nx <= self._load:
+                # green at the left edge -> red at the threshold
+                pos = nx / max(self._load, 0.001)
+                keys[idx] = _rgb((1.0 - pos) * 0.33)
+        return h.pack_key_table(keys)
+
+
+class SpatialAudioVisualizer(Effect):
+    """Spectrum visualizer mapped across physical visual columns x in [0..21].
+
+    The 16 frequency bands correspond directly to visual column groups from left
+    (low bass) to right (treble). Keys in each column light up vertically from
+    bottom row (row 5) up to the function row (row 0) based on band intensity.
+    """
+
+    name = "audio"
+
+    def __init__(
+        self,
+        source: AudioSource,
+        keymap: dict[int, str] | None = None,
+        bands: int = 16,
+        smoothing: float = 0.45,
+        unlit: h.RGB = UNLIT,
+    ) -> None:
+        self._source = source
+        self._bands = bands
+        self._smoothing = max(0.0, min(1.0, smoothing))
+        self._unlit = unlit
+        self._levels = [0.0] * self._bands
+
+        if keymap is None:
+            keymap = h.load_keymap_matrix()
+        self._positions = layout_75pct.index_positions(keymap)
+
+    def frame(self, t: float) -> bytes:
+        raw = self._source.levels(self._bands)
+        self._levels = [
+            old + (new - old) * (1.0 - self._smoothing)
+            for old, new in zip(self._levels, raw)
+        ]
+
+        keys: list[h.RGB] = [self._unlit] * h.KEY_COUNT
+        for idx, (nx, ny) in self._positions.items():
+            # Map normalized nx (0.0..1.0) to band index
+            band_idx = min(self._bands - 1, int(nx * self._bands))
+            band_val = self._levels[band_idx]
+
+            # In visual grid: y=0 is top row (F-row), y=1.0 is bottom row
+            # Height fills from bottom (ny=1.0) upwards towards ny=0.0
+            height_threshold = 1.0 - band_val
+            if ny >= height_threshold:
+                # Vertical gradient: green at bottom (ny=1.0) -> red at top (ny=0.0)
+                vert_pos = 1.0 - ny
+                keys[idx] = _rgb((1.0 - vert_pos) * 0.33)
+
+        return h.pack_key_table(keys)
+
+    def close(self) -> None:
+        self._source.close()
+
+
 EFFECTS = ("rainbow", "cpu", "audio")
 
 
-def create_effect(name: str, *, audio_source: str = "synthetic") -> Effect:
+def create_effect(
+    name: str,
+    *,
+    audio_source: str = "synthetic",
+    spatial: bool = False,
+    diagonal: bool = False,
+) -> Effect:
     name = name.lower()
     if name == "rainbow":
+        if spatial:
+            return SpatialRainbow(diagonal=diagonal)
         return RainbowWave()
     if name == "cpu":
+        if spatial:
+            return SpatialCpuMeter()
         return CpuMeter()
     if name == "audio":
-        return AudioVisualizer(open_audio_source(audio_source))
+        src = open_audio_source(audio_source)
+        if spatial:
+            return SpatialAudioVisualizer(src)
+        return AudioVisualizer(src)
     raise h.AjazzError(f"unknown effect {name!r}; choose from {', '.join(EFFECTS)}")
 
 
@@ -785,6 +960,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run.add_argument("--stop-file", default=None,
                      help="exit when this file appears (daemon control)")
     run.add_argument("--path", default=None, help="explicit HID interface path")
+    run.add_argument("--spatial", action="store_true",
+                     help="use physical key positions for spatial effects")
+    run.add_argument("--diagonal", action="store_true",
+                     help="with --spatial, use x+y diagonal instead of x only")
 
     args = parser.parse_args(argv)
 
@@ -795,6 +974,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         effect = create_effect(
             args.effect,
             audio_source=args.audio_source,
+            spatial=args.spatial,
+            diagonal=args.diagonal,
         )
     except h.AjazzError as exc:
         print(f"error: {exc}", file=sys.stderr)
