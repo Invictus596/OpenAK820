@@ -1,0 +1,22 @@
+# AJAZZ AK820 Max Plus - Phase 1 dependencies
+#
+# The Windows HID backend is implemented with `ctypes` against hid.dll and
+# setupapi.dll, so Phase 1 needs NO third-party packages - only the standard
+# library (Python 3.10+).
+#
+# hidapi is optional. ajazz_hid.py uses it automatically when importable, which
+# is useful for cross-platform work in later phases. On this machine it cannot
+# be installed: there is no prebuilt wheel for Python 3.15 and no MSVC build
+# toolchain, so pip falls back to a source build that fails. Uncomment the line
+# below once a wheel is available for your interpreter.
+#
+# hidapi>=0.14
+
+# GUI dependencies for Phase 3+ (not installed in Phase 1):
+# PyQt6>=6.6
+# pyinstaller>=6.0
+
+# Phase 3 audio visualiser, optional. The engine runs without these; only
+# `cli.py effect audio --audio-source microphone` needs them.
+# numpy>=1.26
+# sounddevice>=0.4
