@@ -226,6 +226,25 @@ See [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) and [TODO.md](TODO.md).
 
 ---
 
+## Acknowledgements & Prior Art
+
+This project builds on prior reverse-engineering of the Ajazz / Sinowealth
+protocol (VID `0x1A2C`). These repositories provided foundational reference
+material and inspiration for Phase 5 (WebHID) and the Interactive Snake Game:
+
+| Repository | Contribution |
+|------------|--------------|
+| [`shrey715/openajazz`](https://github.com/shrey715/openajazz) | Pioneering Python-based CLI/Web control, macros, and music sync for the AK820 Max Plus. |
+| [`NotAProton/ak820-utils`](https://github.com/NotAProton/ak820-utils) | Proved out interactive per-key RGB minigames (Whack-a-mole) and audio visualizers in Go on the Max Plus. |
+| [`MemerGamer/AjazzAk820ProUnofficialWebdriver`](https://github.com/MemerGamer/AjazzAk820ProUnofficialWebdriver) | Established a functional TypeScript WebHID architecture (`protocol.ts`, `device.ts`) for the AK820 Pro. |
+| [`fromagge/ak820-screen`](https://github.com/fromagge/ak820-screen) | WebHID TFT screen manipulation for the AK820 series. |
+| [`arafatamim/OpenRGBAK820Plugin`](https://github.com/arafatamim/OpenRGBAK820Plugin) | Mapped the AK820 Max Plus into OpenRGB and identified the underlying Sinowealth Keyboard Controller architecture. |
+
+See [RESEARCH.md](RESEARCH.md) for the review tracker used before starting
+Phase 5 and the Snake Game.
+
+---
+
 ## License
 
 To be determined (X3 in TODO.md). No vendor code or binaries are included.
