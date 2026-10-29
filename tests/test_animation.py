@@ -551,5 +551,162 @@ class TestDaemonForwarding(unittest.TestCase):
         audio.close()
 
 
+class TestSnakeEffect(unittest.TestCase):
+    """Interactive Snake on the spatial grid."""
+
+    def _full_keymap(self) -> dict[int, str]:
+        """Map every layout label to its first available LED index."""
+        keymap: dict[int, str] = {}
+        for idx, (label, _x, _y) in enumerate(layout_75pct.LAYOUT_75PCT):
+            keymap[idx] = label
+        return keymap
+
+    def test_snake_is_registered(self) -> None:
+        effect = ae.create_effect("snake", fps=10)
+        self.assertIsInstance(effect, ae.InteractiveSnakeEffect)
+        self.assertEqual(effect.name, "snake")
+        effect.close()
+
+    def test_snake_produces_valid_table(self) -> None:
+        keymap = self._full_keymap()
+        effect = ae.InteractiveSnakeEffect(keymap=keymap, fps=10)
+        try:
+            table = effect.frame(0.0)
+            self.assertEqual(len(table), h.KEY_TABLE_SIZE)
+            for rgb in h.parse_key_table(table):
+                self.assertTrue(all(0 <= c <= 255 for c in rgb))
+        finally:
+            effect.close()
+
+    def test_snake_renders_head_body_food(self) -> None:
+        keymap = self._full_keymap()
+        effect = ae.InteractiveSnakeEffect(keymap=keymap, fps=10)
+        try:
+            # Force a known state: body of 3, food at a specific cell.
+            effect._body = [(10, 3), (11, 3), (12, 3)]
+            effect._food = (10, 4)
+            effect._game_over = False
+            effect._started = True
+
+            table = effect.frame(0.0)
+            keys = h.parse_key_table(table)
+
+            # Head at (10,3) -> LED index for "L" (row 3, x=10)
+            head_idx = effect._index_by_pos[(10, 3)]
+            self.assertEqual(keys[head_idx], ae.InteractiveSnakeEffect.HEAD)
+
+            # Body at (11,3) and (12,3)
+            for pos in [(11, 3), (12, 3)]:
+                idx = effect._index_by_pos[pos]
+                self.assertEqual(keys[idx], ae.InteractiveSnakeEffect.BODY)
+
+            # Food at (10,4)
+            food_idx = effect._index_by_pos[(10, 4)]
+            self.assertEqual(keys[food_idx], ae.InteractiveSnakeEffect.FOOD)
+
+            # All other mapped keys are unlit.
+            for idx in effect._positions:
+                pos = (
+                    round(effect._positions[idx][0] * layout_75pct.GRID_X_MAX),
+                    round(effect._positions[idx][1] * layout_75pct.GRID_Y_MAX),
+                )
+                if pos not in [(10, 3), (11, 3), (12, 3), (10, 4)]:
+                    self.assertEqual(keys[idx], ae.UNLIT, f"index {idx} should be unlit")
+        finally:
+            effect.close()
+
+    def test_snake_advance_moves_head(self) -> None:
+        keymap = self._full_keymap()
+        effect = ae.InteractiveSnakeEffect(keymap=keymap, fps=10)
+        try:
+            effect._body = [(10, 3), (11, 3)]
+            effect._dx, effect._dy = (-1, 0)  # moving left
+            effect._food = (9, 3)
+            effect._started = True
+
+            effect._advance()
+            # Head moved from (10,3) to (9,3) which is food -> grows
+            self.assertEqual(effect._body[0], (9, 3))
+            self.assertEqual(len(effect._body), 3)  # grew by 1
+            self.assertNotEqual(effect._food, (9, 3))  # new food spawned
+        finally:
+            effect.close()
+
+    def test_snake_ignores_180_reversal(self) -> None:
+        keymap = self._full_keymap()
+        effect = ae.InteractiveSnakeEffect(keymap=keymap, fps=10)
+        try:
+            effect._dx, effect._dy = (1, 0)  # moving right
+
+            # Try to reverse directly to left -> should be ignored.
+            with effect._dir_lock:
+                effect._pending_dir = (-1, 0)
+            effect._apply_pending_dir()
+            self.assertEqual((effect._dx, effect._dy), (1, 0))
+
+            # A perpendicular turn should work.
+            with effect._dir_lock:
+                effect._pending_dir = (0, -1)  # up
+            effect._apply_pending_dir()
+            self.assertEqual((effect._dx, effect._dy), (0, -1))
+        finally:
+            effect.close()
+
+    def test_snake_wall_collision_resets(self) -> None:
+        keymap = self._full_keymap()
+        effect = ae.InteractiveSnakeEffect(keymap=keymap, fps=10)
+        try:
+            effect._body = [(0, 0)]  # Esc at top-left corner
+            effect._dx, effect._dy = (-1, 0)  # moving left -> off grid
+            effect._food = (1, 0)
+            effect._started = True
+
+            effect._advance()
+            self.assertTrue(effect._game_over)
+            # After the crash timer fires, the game resets.
+            # Wait for the reset timer (0.35s).
+            time.sleep(0.4)
+            self.assertFalse(effect._game_over)
+            self.assertEqual(len(effect._body), len(effect.START_BODY))
+        finally:
+            effect.close()
+
+    def test_snake_self_collision_resets(self) -> None:
+        keymap = self._full_keymap()
+        effect = ae.InteractiveSnakeEffect(keymap=keymap, fps=10)
+        try:
+            effect._body = [(5, 5), (5, 4), (4, 4), (4, 5)]
+            effect._dx, effect._dy = (0, -1)  # head at (5,5) moving up to (5,4) = body
+            effect._food = (6, 5)
+            effect._started = True
+
+            effect._advance()
+            self.assertTrue(effect._game_over)
+            time.sleep(0.4)
+            self.assertFalse(effect._game_over)
+            self.assertEqual(len(effect._body), len(effect.START_BODY))
+        finally:
+            effect.close()
+
+    def test_unmapped_slots_stay_dark(self) -> None:
+        """Only mapped keys can be lit; LED placeholders stay off."""
+        keymap = {15: "Esc", 14: "F1", 57: "Tab"}  # only 3 mapped
+        effect = ae.InteractiveSnakeEffect(keymap=keymap, fps=10)
+        try:
+            effect._body = [(0, 0)]  # Esc position
+            effect._food = (2, 0)    # F1 position
+            effect._started = True
+
+            table = effect.frame(0.0)
+            keys = h.parse_key_table(table)
+
+            # LED slots (not in keymap) are always unlit.
+            for i in range(h.KEY_COUNT):
+                if i not in keymap:
+                    self.assertEqual(keys[i], ae.UNLIT, f"LED slot {i} should be dark")
+        finally:
+            effect.close()
+
+
 if __name__ == "__main__":
     unittest.main()

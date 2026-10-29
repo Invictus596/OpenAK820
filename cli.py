@@ -300,6 +300,7 @@ def _run_effect(args: argparse.Namespace) -> int:
         audio_source=audio_source_name,
         spatial=spatial,
         diagonal=diagonal,
+        fps=args.fps if args.name == "snake" else DEFAULT_FPS,
     )
 
     if args.dry_run:

@@ -24,3 +24,6 @@ sounddevice>=0.4
 # Phase 6 system-tray service (tray_service.py):
 pystray>=0.19
 Pillow>=10.0
+
+# Phase 4 snake game: global async keyboard hooks (WASD / arrows).
+pynput>=1.7

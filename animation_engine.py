@@ -51,6 +51,37 @@ from typing import Callable, Optional, Protocol, Sequence
 import ajazz_hid as h
 import layout_75pct
 
+# pynput is optional: the snake effect needs it for global key hooks, but the
+# rest of the engine runs without it.  Install with ``pip install pynput``.
+try:
+    from pynput.keyboard import Key, Listener as _KeyListener
+    _PYNPUT_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    _PYNPUT_AVAILABLE = False
+
+    class _KeyListener:  # type: ignore[no-redef]
+        """Stub so the module imports cleanly without pynput."""
+
+        def __init__(self, *args, **kwargs):
+            raise h.AjazzError(
+                "the snake effect needs pynput (pip install pynput)"
+            )
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def join(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
 BASE_DIR = Path(__file__).resolve().parent
 
 #: Daemon bookkeeping (all under the project directory).
@@ -572,7 +603,240 @@ class SpatialAudioVisualizer(Effect):
         self._source.close()
 
 
-EFFECTS = ("rainbow", "cpu", "audio")
+class InteractiveSnakeEffect(Effect):
+    """Interactive Snake on the physical 75% grid.
+
+    The snake moves one cell per tick (default 10 ticks/second).  WASD and
+    arrow keys change direction via a background ``pynput.keyboard.Listener``.
+    180-degree reversals are ignored.  Hitting a wall or yourself flashes the
+    board red and resets the game.  Eating food grows the snake and spawns new
+    food on a valid physical key.
+
+    Only keys present in ``keymap_matrix.json`` *and* ``layout_75pct.py`` are
+    valid cells; unmapped LED slots stay off.
+    """
+
+    name = "snake"
+
+    # Colours
+    HEAD = (255, 255, 0)   # yellow
+    BODY = (0, 255, 0)     # green
+    FOOD = (255, 0, 0)     # red
+    FLASH = (255, 0, 0)    # crash flash
+
+    # Default start: around the "L" key at grid (10, 3), moving left.
+    START_POS = (10, 3)
+    START_BODY = [(10, 3), (11, 3), (12, 3)]
+    START_DIR = (-1, 0)  # moving left
+
+    def __init__(
+        self,
+        keymap: dict[int, str] | None = None,
+        fps: float = 10.0,
+        unlit: h.RGB = UNLIT,
+    ) -> None:
+        if not _PYNPUT_AVAILABLE:
+            raise h.AjazzError(
+                "the snake effect needs pynput (pip install pynput); "
+                "install it and try again"
+            )
+
+        super().__init__()
+        self.fps = max(1.0, float(fps))
+        self._tick_interval = 1.0 / self.fps
+        self._unlit = unlit
+        self._last_tick = 0.0
+        self._flash_until = 0.0  # crash flash end time (seconds since start)
+
+        # Resolve LED index -> (x, y) from keymap + layout grid.
+        self._positions = layout_75pct.index_positions(keymap or h.load_keymap_matrix())
+        # Reverse map: (x, y) -> LED index, for fast look-up.
+        self._index_by_pos: dict[tuple[int, int], int] = {}
+        for idx, pos in self._positions.items():
+            # Convert normalised (0..1) back to raw grid ints.
+            gx = round(pos[0] * layout_75pct.GRID_X_MAX)
+            gy = round(pos[1] * layout_75pct.GRID_Y_MAX)
+            self._index_by_pos[(gx, gy)] = idx
+
+        self._valid_positions = set(self._index_by_pos.keys())
+
+        # Input state (set by the pynput listener thread).
+        self._dir_lock = threading.Lock()
+        self._dx, self._dy = self.START_DIR
+        self._pending_dir: Optional[tuple[int, int]] = None
+
+        # Game state.
+        self._body: list[tuple[int, int]] = []
+        self._food: Optional[tuple[int, int]] = None
+        self._game_over = False
+        self._rng = random.Random()
+        self._started = False
+
+        self._listener: Optional[_KeyListener] = None
+        self._listener_thread: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------------
+    # Input handling (runs on the pynput listener thread)
+    # ------------------------------------------------------------------
+    def _on_press(self, key) -> None:
+        """Translate a keypress into a direction change."""
+        try:
+            char = getattr(key, "char", None)
+            if char is not None:
+                char = char.lower()
+        except AttributeError:
+            char = None
+
+        mapping: dict[str | int, tuple[int, int]] = {
+            "w": (0, -1),
+            "a": (-1, 0),
+            "s": (0, 1),
+            "d": (1, 0),
+            Key.up: (0, -1),
+            Key.down: (0, 1),
+            Key.left: (-1, 0),
+            Key.right: (1, 0),
+        }
+
+        new_dir = mapping.get(key) or mapping.get(char)
+        if new_dir is None:
+            return
+
+        with self._dir_lock:
+            # Ignore 180-degree reversals.
+            if (new_dir[0] + self._dx, new_dir[1] + self._dy) != (0, 0):
+                self._pending_dir = new_dir
+
+    def _start_listener(self) -> None:
+        """Start the pynput keyboard listener in a background thread."""
+        self._listener = _KeyListener(on_press=self._on_press)
+        self._listener.start()
+
+    def _stop_listener(self) -> None:
+        """Stop the listener and wait for its thread to finish."""
+        if self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+            self._listener = None
+
+    # ------------------------------------------------------------------
+    # Game logic
+    # ------------------------------------------------------------------
+    def _reset(self) -> None:
+        """Start a new game."""
+        self._body = list(self.START_BODY)
+        self._dx, self._dy = self.START_DIR
+        self._pending_dir = None
+        self._game_over = False
+        self._spawn_food()
+
+    def _spawn_food(self) -> None:
+        """Place food on a valid cell not occupied by the snake."""
+        available = [p for p in self._valid_positions if p not in self._body]
+        if not available:
+            # Board is full: the player won.
+            self._food = None
+            return
+        self._food = self._rng.choice(available)
+
+    def _apply_pending_dir(self) -> None:
+        with self._dir_lock:
+            if self._pending_dir is not None:
+                # Ignore 180-degree reversals.
+                if (self._pending_dir[0] + self._dx,
+                    self._pending_dir[1] + self._dy) != (0, 0):
+                    self._dx, self._dy = self._pending_dir
+                self._pending_dir = None
+
+    def _advance(self) -> None:
+        """Advance the snake one cell.  Returns False on crash."""
+        self._apply_pending_dir()
+
+        hx, hy = self._body[0]
+        nx, ny = hx + self._dx, hy + self._dy
+
+        # Wall collision: out of bounds or no key at that cell.
+        if not (0 <= nx <= layout_75pct.GRID_X_MAX and 0 <= ny <= layout_75pct.GRID_Y_MAX):
+            self._crash()
+            return
+        if (nx, ny) not in self._valid_positions:
+            self._crash()
+            return
+
+        # Self collision.
+        if (nx, ny) in self._body:
+            self._crash()
+            return
+
+        self._body.insert(0, (nx, ny))
+
+        # Food collision: grow, don't pop tail, spawn new food.
+        if self._food is not None and (nx, ny) == self._food:
+            self._spawn_food()
+        else:
+            self._body.pop()
+
+    def _crash(self) -> None:
+        """Game over: flash red and reset after the flash frame."""
+        self._game_over = True
+        self._flash_until = time.perf_counter() + 0.25  # 250 ms flash
+        # Reset on the next tick after the flash.
+        threading.Timer(0.35, self._reset).start()
+
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
+    def frame(self, t: float) -> bytes:
+        if not self._started:
+            self._reset()
+            self._start_listener()
+            self._started = True
+            self._last_tick = t
+
+        # Advance the game on tick interval.
+        if t - self._last_tick >= self._tick_interval:
+            self._advance()
+            self._last_tick = t
+
+        flashing = self._game_over and t < self._flash_until
+
+        keys: list[h.RGB] = [self._unlit] * h.KEY_COUNT
+
+        if flashing:
+            # Flash the whole snake red.
+            for pos in self._body:
+                idx = self._index_by_pos.get(pos)
+                if idx is not None:
+                    keys[idx] = self.FLASH
+            if self._food is not None:
+                fidx = self._index_by_pos.get(self._food)
+                if fidx is not None:
+                    keys[fidx] = self.FLASH
+        else:
+            # Food.
+            if self._food is not None:
+                fidx = self._index_by_pos.get(self._food)
+                if fidx is not None:
+                    keys[fidx] = self.FOOD
+            # Head.
+            head_idx = self._index_by_pos.get(self._body[0])
+            if head_idx is not None:
+                keys[head_idx] = self.HEAD
+            # Body.
+            for pos in self._body[1:]:
+                idx = self._index_by_pos.get(pos)
+                if idx is not None:
+                    keys[idx] = self.BODY
+
+        return h.pack_key_table(keys)
+
+    def close(self) -> None:
+        self._stop_listener()
+
+
+EFFECTS = ("rainbow", "cpu", "audio", "snake")
 
 
 def create_effect(
@@ -581,6 +845,7 @@ def create_effect(
     audio_source: str = "synthetic",
     spatial: bool = False,
     diagonal: bool = False,
+    fps: float = DEFAULT_FPS,
 ) -> Effect:
     name = name.lower()
     if name == "rainbow":
@@ -596,6 +861,8 @@ def create_effect(
         if spatial:
             return SpatialAudioVisualizer(src)
         return AudioVisualizer(src)
+    if name == "snake":
+        return InteractiveSnakeEffect(fps=fps)
     raise h.AjazzError(f"unknown effect {name!r}; choose from {', '.join(EFFECTS)}")
 
 
@@ -1091,6 +1358,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             audio_source=args.audio_source,
             spatial=args.spatial,
             diagonal=args.diagonal,
+            fps=args.fps if args.effect == "snake" else DEFAULT_FPS,
         )
     except h.AjazzError as exc:
         print(f"error: {exc}", file=sys.stderr)
